@@ -1,0 +1,6 @@
+[submodule "Dependencies/idevice"]
+	path = Dependencies/idevice
+	url = https://github.com/jkcoxson/idevice.git
+[submodule "Tools/idevice_pair"]
+	path = Tools/idevice_pair
+	url = https://github.com/jkcoxson/idevice_pair.git

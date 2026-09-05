@@ -1,0 +1,167 @@
+import Foundation
+import UniformTypeIdentifiers
+import UIKit
+
+@MainActor
+final class PairingStore: ObservableObject {
+    @Published private(set) var hasPairingFile = false
+    @Published var lastError: String?
+
+    static let fileName = "rp_pairing_file.plist"
+    static let supportedTypes: [UTType] = {
+        var types: [UTType] = [
+            .item,          // anything — sideloaded plists often lack a proper UTI
+            .data,
+            .propertyList,
+            .xml,
+        ]
+        for ext in ["plist", "mobiledevicepairing", "mobiledevicepair"] {
+            if let t = UTType(filenameExtension: ext) {
+                types.append(t)
+            }
+        }
+        if let custom = UTType("com.saint.locationsimulator.personal.rppairing") {
+            types.append(custom)
+        }
+        return types
+    }()
+
+    private var directoryURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Pairing", isDirectory: true)
+    }
+
+    var pairingURL: URL {
+        directoryURL.appendingPathComponent(Self.fileName)
+    }
+
+    var pairingPath: String { pairingURL.path }
+
+    var hasRemotePairingKeys: Bool {
+        guard let data = try? Data(contentsOf: pairingURL),
+              let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) else {
+            return false
+        }
+        let keys = Self.collectKeys(in: object)
+        return keys.contains("identifier")
+            && keys.contains("public_key")
+            && keys.contains("private_key")
+    }
+
+    init() {
+        refresh()
+    }
+
+    func refresh() {
+        try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        hasPairingFile = FileManager.default.fileExists(atPath: pairingURL.path)
+        if hasPairingFile { protectPairingFile() }
+    }
+
+    func importPairing(from sourceURL: URL) throws {
+        let accessing = sourceURL.startAccessingSecurityScopedResource()
+        defer { if accessing { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        let data = try Data(contentsOf: sourceURL)
+        try installPairingData(data)
+    }
+
+    /// LiveContainer / broken pickers: copy the plist text (or file) then paste here.
+    func importPairingFromClipboard() throws {
+        let board = UIPasteboard.general
+
+        if let url = board.url ?? board.urls?.first {
+            if url.isFileURL {
+                try importPairing(from: url)
+                return
+            }
+        }
+
+        let candidates: [Data?] = [
+            board.data(forPasteboardType: "com.apple.property-list"),
+            board.data(forPasteboardType: UTType.propertyList.identifier),
+            board.data(forPasteboardType: UTType.xml.identifier),
+            board.data(forPasteboardType: UTType.data.identifier),
+            board.string?.data(using: .utf8),
+        ]
+
+        guard let data = candidates.compactMap({ $0 }).first(where: { !$0.isEmpty }) else {
+            throw PairingImportError.emptyClipboard
+        }
+        try installPairingData(data)
+    }
+
+    func removePairing() throws {
+        if FileManager.default.fileExists(atPath: pairingURL.path) {
+            try FileManager.default.removeItem(at: pairingURL)
+        }
+        hasPairingFile = false
+    }
+
+    private func installPairingData(_ data: Data) throws {
+        guard looksLikePairingPlist(data) else {
+            throw PairingImportError.invalidContents
+        }
+
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        // Background reconnect must be able to read the credential after the
+        // screen locks. It remains encrypted and unavailable before first unlock.
+        try data.write(to: pairingURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pairingURL.path)
+        protectPairingFile()
+        hasPairingFile = true
+        lastError = nil
+    }
+
+    private func protectPairingFile() {
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication, .posixPermissions: 0o600],
+            ofItemAtPath: pairingURL.path
+        )
+        // This file is a device trust credential. Keep it local and out of
+        // iCloud/device backups even when the rest of the app is backed up.
+        var securedURL = pairingURL
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try? securedURL.setResourceValues(resourceValues)
+    }
+
+    private func looksLikePairingPlist(_ data: Data) -> Bool {
+        if let obj = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) {
+            return obj is [AnyHashable: Any] || obj is [Any]
+        }
+        // XML plist often starts with these markers when copied as text.
+        guard let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        return text.hasPrefix("<?xml") || text.hasPrefix("bplist") || text.contains("<plist")
+    }
+
+    private static func collectKeys(in value: Any) -> Set<String> {
+        if let dictionary = value as? [AnyHashable: Any] {
+            return dictionary.reduce(into: Set<String>()) { result, entry in
+                result.insert(String(describing: entry.key).lowercased())
+                result.formUnion(collectKeys(in: entry.value))
+            }
+        }
+        if let array = value as? [Any] {
+            return array.reduce(into: Set<String>()) { result, child in
+                result.formUnion(collectKeys(in: child))
+            }
+        }
+        return []
+    }
+}
+
+enum PairingImportError: LocalizedError {
+    case emptyClipboard
+    case invalidContents
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyClipboard:
+            return "Clipboard is empty. Copy your RPPairing plist text (or the file), then try Paste again."
+        case .invalidContents:
+            return "That doesn’t look like an RPPairing plist. Copy the full pairing file contents and try again."
+        }
+    }
+}
